@@ -1,26 +1,57 @@
 """
 create-varset.py
-This script automates the management of global priority variable sets (varsets) across all organizations in a Terraform Enterprise (TFE) instance. It supports creating, updating, and deleting a specific global priority varset for each organization, and synchronizes the variables within the varset according to a predefined configuration.
+
+This script automates the management of global priority variable sets (varsets) across all organizations in a Terraform Enterprise (TFE) instance. 
+It supports creating, updating, and deleting a specific global priority varset for each organization, and synchronizes the variables within the varset according to a predefined configuration.
+
 Features:
-- Lists all organizations in the TFE instance using paginated API requests.
 - Creates a global, priority varset with a specified name and description for each organization.
-- Adds a set of predefined variables to the varset, with support for variable attributes such as sensitivity, category, and HCL flag.
+- Adds predefined variables to the varset, with support for variable attributes such as sensitivity, category, and HCL flag.
 - Updates existing varsets by comparing current variables with the desired configuration, adding new variables, updating changed ones, and deleting variables not present in the desired list.
 - Deletes the global priority varset from each organization if requested.
-- Handles API authentication via an admin token, and manages API rate limits with configurable sleep intervals.
+- Handles API authentication via an admin token, via prompting or environment variable: TFE_ADMIN_TOKEN.
+- Supports dry-run mode to preview changes without making modifications.
+- Uses multithreading to process multiple organizations concurrently for improved performance.
+- Logs detailed output to both the console and a log file.
+- Reports total script runtime at completion.
+
+Usage Flow:
+1. Create:  
+   Start by running the script with `--mode create` to create the global priority varset and add the initial set of variables to each organization.
+2. Update:  
+   When you want to synchronize or change the variables in the varset (add, update, or remove variables), run the script with `--mode update`.
+3. Delete:  
+   If you need to remove the global priority varset from organizations, run the script with `--mode delete`.
+
+
 Usage:
-    python create-varset.py --mode [create|update|delete]
+    python create-varset.py --mode [create|update|delete] --config CONFIG_FILE [--orgs ORGS] [--dry-run] [--log-level LEVEL] [--max-workers N]
+
 Arguments:
     --mode: Operation mode. 
         - 'create': Create the global priority varset and add variables (default).
         - 'update': Synchronize variables in the varset with the desired configuration.
         - 'delete': Delete the global priority varset from each organization.
+    --config: Path to YAML config file (required).
+    --orgs: Path to a file with org names (one per line) or comma-separated list of org names.
     --dry-run: Show what would change, but do not make any changes.
+    --log-level: Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+    --max-workers: Number of concurrent threads to use for processing organizations (default: 5).
+
 Environment:
     - Requires an admin API token for authentication.
-Note:
+    - Set the token using the TFE_ADMIN_TOKEN environment variable, or you will be prompted securely.
+
+Notes:
     - Sensitive variable values cannot be read back from the API; updates may overwrite them.
     - Designed for administrative use; use with caution in production environments.
+    - Everything will be logged to both the console and 'execution.log'.
+    - Organization selection precedence:
+        1. If the optional --orgs flag is provided:
+            - If the value is a path to a file, each line in the file is treated as an organization name.
+            - Otherwise, the value is parsed as a comma-separated list of organization names (e.g, org1,org2,org3).
+        2. If --orgs is not provided, but the config file (provided via --config) contains an 'organizations' key, those organizations are used.
+        3. If neither of the above are provided, the script will fetch and process all organizations available in the TFE instance.
 """
 
 import getpass
@@ -29,40 +60,40 @@ import time
 import argparse
 import yaml
 import os
+import logging
+import concurrent.futures
 
-tfe_url = None
-varset_name = None
+tfe_url = None 
 varset_description = None
 varset_vars = None
-# Use yaml config file instead! 
-# Variables to configure
-# tfe_url = "https://tfe-migrate-from.phoebe-lee.sbx.hashidemos.io"
-# varset_name = "global-proxy-override"
-# varset_description = "Global proxy override varset for proxy"
-# varset_vars = [
-#     {
-#       "key": "proxy",
-#       "value": "https://proxy.example.com:8080",
-#       "description": "Proxy for this and that",
-#       "sensitive": False,
-#       "category": "terraform",
-#       "hcl": False
-#     },
-#     {
-#       "key": "key_example",
-#       "value": "61e400d5ccffb3782f215344481e6c82"
-#     }
-# ]
 
 api_prefix = "/api/v2/"
 admin_token = ""
 headers = {}
 
-# Read in config
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("execution.log"),
+        logging.StreamHandler()
+    ])
+logger = logging.getLogger(__name__)
+
+# Read in config file
 def load_config(config_path="config.yaml"):
     with open(config_path, "r") as file:
         config = yaml.safe_load(file)
+        validate_config(config)
     return config
+
+# Validate config file. Required keys: tfe_url, varset_name, varset_vars
+def validate_config(config):
+    required = ["tfe_url", "varset_name", "varset_vars"]
+    for key in required:
+        if key not in config:
+            raise ValueError(f"Missing required config key: {key}")
 
 # Get list of orgs with pagination
 def list_orgs():
@@ -85,7 +116,7 @@ def list_orgs():
                 break
 
             orgs.extend(page_orgs)
-            print(f"Retrieved {len(page_orgs)} orgs from page {page_number}")
+            logger.info(f"Retrieved {len(page_orgs)} orgs from page {page_number}")
 
             # Stop if no more pages
             if not data.get("links", {}).get("next"):
@@ -94,7 +125,7 @@ def list_orgs():
             page_number += 1
 
         except requests.exceptions.RequestException as e:
-            print(f"Error listing orgs on page {page_number}: {e}")
+            logger.error(f"Error listing orgs on page {page_number}: {e}")
             break
     
     return orgs
@@ -117,32 +148,32 @@ def create_global_priority_varset(org_name, dry_run=False):
     if dry_run:
         existing_id = get_global_priority_varset_id(org_name)
         if existing_id:
-            print(f"[DRY RUN] Varset '{varset_name}' already exists for org {org_name} (id: {existing_id}). Would not create.")
+            logger.info(f"[DRY RUN] Varset '{varset_name}' already exists for org {org_name} (id: {existing_id}). Would not create.")
         else:
-            print(f"[DRY RUN] Would create varset for org {org_name} with payload: {payload}")
+            logger.info(f"[DRY RUN] Would create varset for org {org_name} with payload: {payload}")
             for var in varset_vars:
-                print(f"[DRY RUN] Would add variable {var['key']} to varset for org {org_name}")
+                logger.info(f"[DRY RUN] Would add variable {var['key']} to varset for org {org_name}")
         return
 
     try:
         response = requests.post(url, headers=headers, json=payload)
         if response.status_code == 201:
             varset_id = response.json()["data"]["id"]
-            print(f"Varset created for org {org_name} with ID {varset_id}")
+            logger.info(f"Varset created for org {org_name} with ID {varset_id}")
 
             for var in varset_vars:
                 add_variable(varset_id, var, dry_run=dry_run)
 
         elif response.status_code == 422:
             if response.json()["errors"][0]["detail"] == "Name has already been taken":
-                print(f"! Varset {varset_name} already exists for org {org_name}")
+                logger.warning(f"! Varset {varset_name} already exists for org {org_name}")
             else:
-                print(f"! Problem creating varset for org {org_name}: {response.status_code} - {response.text}")
+                logger.error(f"! Problem creating varset for org {org_name}: {response.status_code} - {response.text}")
         else:
-            print(f"! Organization {org_name} not found: {response.status_code} - {response.text}")
+            logger.error(f"! Organization {org_name} not found: {response.status_code} - {response.text}")
     
     except requests.exceptions.RequestException as e:
-        print(f"Request to create global priority varset failed: {e}")
+        logger.error(f"Request to create global priority varset failed: {e}")
 
 # Add a variable to the varset, will be adding variables based on the varset_vars list
 def add_variable(varset_id, var, dry_run=False):
@@ -162,47 +193,47 @@ def add_variable(varset_id, var, dry_run=False):
     }
 
     if dry_run:
-        print(f"[DRY RUN] Would add variable {var['key']} to varset {varset_id} with payload: {payload}")
+        logger.info(f"[DRY RUN] Would add variable {var['key']} to varset {varset_id} with payload: {payload}")
         return
 
     try:
         response = requests.post(url, headers=headers, json=payload)
         if response.status_code == 201:
-            print(f"+ Variable {var['key']} added to varset {varset_id}")
+            logger.info(f"+ Variable {var['key']} added to varset {varset_id}")
         elif response.status_code == 422:
-            print(f"! Problem adding variable {var['key']} to varset {varset_id}: {response.status_code} - {response.text}")
+            logger.error(f"! Problem adding variable {var['key']} to varset {varset_id}: {response.status_code} - {response.text}")
         else:
-            print(f"! Varset {varset_id} not found: {response.status_code} - {response.text}")
+            logger.error(f"! Varset {varset_id} not found: {response.status_code} - {response.text}")
     
     except requests.exceptions.RequestException as e:
-        print(f"Request to add variable to varset failed: {e}")
+        logger.error(f"Request to add variable to varset failed: {e}")
 
 def delete_global_priority_varset(org_name, dry_run=False):
     varset_id = get_global_priority_varset_id(org_name)
     if not varset_id:
-        print(f"No global priority varset found for org {org_name}")
+        logger.warning(f"No global priority varset found for org {org_name}")
         return
 
     url = f"{tfe_url}{api_prefix}varsets/{varset_id}"
     if dry_run:
-        print(f"[DRY RUN] Would delete varset {varset_id} for org {org_name}")
+        logger.info(f"[DRY RUN] Would delete varset {varset_id} for org {org_name}")
         return
 
     try: 
         response = requests.delete(url, headers=headers)
         if response.status_code == 204:
-            print(f"- Varset {varset_id} deleted for org {org_name}")
+            logger.info(f"- Varset {varset_id} deleted for org {org_name}")
         elif response.status_code == 404:
-            print(f"! Varset {varset_id} not found for org {org_name}: {response.status_code} - {response.text}")
+            logger.error(f"! Varset {varset_id} not found for org {org_name}: {response.status_code} - {response.text}")
         else:
-            print(f"! Error deleting varset {varset_id} for org {org_name}: {response.status_code} - {response.text}")
+            logger.error(f"! Error deleting varset {varset_id} for org {org_name}: {response.status_code} - {response.text}")
     except requests.exceptions.RequestException as e:
-        print(f"Request to delete varset failed: {e}")
+        logger.error(f"Request to delete varset failed: {e}")
 
 def delete_variable(varset_id, var_id, var_name, dry_run=False):
     url = f"{tfe_url}{api_prefix}varsets/{varset_id}/relationships/vars/{var_id}"
     if dry_run:
-        print(f"[DRY RUN] Would delete variable {var_name} (id {var_id}) from varset {varset_id}")
+        logger.info(f"[DRY RUN] Would delete variable {var_name} (id {var_id}) from varset {varset_id}")
         return
 
     try:
@@ -210,12 +241,12 @@ def delete_variable(varset_id, var_id, var_name, dry_run=False):
         response.raise_for_status()
 
         if response.status_code == 204:
-            print(f"- Variable {var_name} was deleted from varset because it was not in the desired list")
+            logger.info(f"- Variable {var_name} was deleted from varset because it was not in the desired list")
         else:
-            print(f"! Error deleting variable {var_name}: {response.status_code} - {response.text}")
+            logger.error(f"! Error deleting variable {var_name}: {response.status_code} - {response.text}")
     
     except requests.exceptions.RequestException as e:
-        print(f"Request to update variable failed: {e}")
+        logger.error(f"Request to update variable failed: {e}")
 
 def update_variable(varset_id, var_id, desired, dry_run=False):
     url = f"{tfe_url}{api_prefix}varsets/{varset_id}/relationships/vars/{var_id}"
@@ -234,7 +265,7 @@ def update_variable(varset_id, var_id, desired, dry_run=False):
     }
 
     if dry_run:
-        print(f"[DRY RUN] Would update variable {desired['key']} in varset {varset_id} with payload: {payload}")
+        logger.info(f"[DRY RUN] Would update variable {desired['key']} in varset {varset_id} with payload: {payload}")
         return
 
     try:
@@ -242,14 +273,14 @@ def update_variable(varset_id, var_id, desired, dry_run=False):
         response.raise_for_status()
 
         if response.status_code == 200:
-            print(f"~ Variable {desired['key']} updated")
+            logger.info(f"~ Variable {desired['key']} updated")
         elif response.status_code == 404:
-            print(f"! Varset {varset_id} not found: {response.status_code} - {response.text}")
+            logger.error(f"! Varset {varset_id} not found: {response.status_code} - {response.text}")
         else:
-            print(f"! Error updating variable {desired['key']}: {response.status_code} - {response.text}")
+            logger.error(f"! Error updating variable {desired['key']}: {response.status_code} - {response.text}")
     
     except requests.exceptions.RequestException as e:
-        print(f"Request to update variable failed: {e}")
+        logger.error(f"Request to update variable failed: {e}")
 
 def check_diffs_variables_in_varset(varset_id, varset_vars, dry_run=False):
     current_vars = get_variables_in_varset(varset_id)
@@ -277,7 +308,7 @@ def check_diffs_variables_in_varset(varset_id, varset_vars, dry_run=False):
         if needs_update:
             update_variable(varset_id, current["id"], desired, dry_run=dry_run)
         else:
-            print(f"No updates found to be made on variable: {current_attrs.get('key')}")
+            logger.info(f"No updates found to be made on variable: {current_attrs.get('key')}")
     
     # Delete any variables that are not in the desired list
     for key, var in current_dict.items():
@@ -287,7 +318,7 @@ def check_diffs_variables_in_varset(varset_id, varset_vars, dry_run=False):
 def update_global_priority_varset(org, dry_run=False):
     varset_id = get_global_priority_varset_id(org)
     if not varset_id:
-        print(f"! No global priority varset found to update")
+        logger.warning(f"! No global priority varset found to update")
         return
     check_diffs_variables_in_varset(varset_id, varset_vars, dry_run=dry_run)
 
@@ -316,7 +347,7 @@ def get_global_priority_varset_id(org_name):
             page_number += 1
             
         except requests.exceptions.RequestException as e:
-            print(f"Request to get global priority varset failed: {e}")
+            logger.error(f"Request to get global priority varset failed: {e}")
             break
 
     return None
@@ -329,8 +360,21 @@ def get_variables_in_varset(varset_id):
         response.raise_for_status()
         return response.json().get("data", [])
     except requests.exceptions.RequestException as e:
-        print(f"Request to get variables in varset failed: {e}")
+        logger.error(f"Request to get variables in varset failed: {e}")
         return []
+
+def process_org(org, mode, dry_run):
+    logger.info(f"Processing org: {org}")
+    if mode == "create":
+        logger.info(f"Creating global priority varset for org {org}...")
+        create_global_priority_varset(org, dry_run=dry_run)
+    elif mode == "delete":
+        logger.info(f"Deleting varset for org {org}...")
+        delete_global_priority_varset(org, dry_run=dry_run)
+    elif mode == "update":
+        logger.info(f"Updating varset for org {org}...")
+        update_global_priority_varset(org, dry_run=dry_run)
+    time.sleep(0.5)  # To avoid API rate limits
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Create global priority varset for each org in TFE")
@@ -338,8 +382,11 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Show what would change, but do not make any changes.")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     parser.add_argument("--orgs", help="Comma-separated list of org names or path to a file with org names (one per line)")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Set the logging level (default: INFO)")
+    parser.add_argument("--max-workers", type=int, default=5, help="Number of concurrent threads (default: 5)")
     args = parser.parse_args()
 
+    logging.getLogger().setLevel(args.log_level.upper())
     # Load config file
     config = load_config(args.config)
     tfe_url = config["tfe_url"]
@@ -347,7 +394,10 @@ if __name__ == "__main__":
     varset_description = config.get("varset_description", "")                           
     varset_vars = config["varset_vars"]
 
-    admin_token = getpass.getpass("Enter your admin token (output will be hidden): ")
+    admin_token = os.getenv("TFE_ADMIN_TOKEN") or getpass.getpass("Enter your admin token: ")
+    
+    start_time = time.time()
+
     headers = {
         "Authorization": f"Bearer {admin_token}",
         "Content-Type": "application/vnd.api+json"
@@ -366,21 +416,23 @@ if __name__ == "__main__":
     else:
         organizations = list_orgs()
 
-    print(f"Found {len(organizations)} orgs")
-    print(f"Orgs: {organizations}")
+    logger.info(f"Found {len(organizations)} orgs")
+    logger.info(f"Orgs: {organizations}")
 
-    for i, org in enumerate(organizations, start=1):
-        print(f"\n[{i}/{len(organizations)}] Processing org: {org}")
-        if args.mode == "create":
-            print(f"Creating global priority varset for org {org}...")
-            create_global_priority_varset(org, dry_run=args.dry_run)
+    # Process each organization in parallel, max 5 threads
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        futures = [
+            executor.submit(process_org, org, args.mode, args.dry_run)
+            for org in organizations
+        ]
+        for i, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+            try:
+                future.result()
+                logger.info(f"[{i}/{len(organizations)}] Finished processing org")
+            except Exception as exc:
+                logger.error(f"Error processing org: {exc}")
 
-        elif args.mode == "delete":
-            print(f"Deleting varset for org {org}...")
-            delete_global_priority_varset(org, dry_run=args.dry_run)
+    end_time = time.time()
 
-        elif args.mode == "update":
-            print(f"Updating varset for org {org}...")
-            update_global_priority_varset(org, dry_run=args.dry_run)
-             
-        time.sleep(0.5)  # Tiny sleep to avoid hitting API rate limits
+    # Calculate and log total runtime
+    logger.info(f"Total script runtime: {end_time - start_time:.2f} seconds")
