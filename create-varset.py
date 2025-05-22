@@ -179,7 +179,7 @@ def create_global_priority_varset(org_name, dry_run=False):
         if response.status_code == 201:
             varset_id = response.json()["data"]["id"]
             logger.info(f"Varset created for org {org_name} with ID {varset_id}")
-            log_report(org_name, "create_varset", varset_id, status="success")
+            log_report(org_name, "create_varset", varset_id, status="success", message=f"Varset created for org {org_name} with ID {varset_id}")
 
             for var in varset_vars:
                 add_variable(org_name, varset_id, var, dry_run=dry_run)
@@ -252,7 +252,7 @@ def delete_global_priority_varset(org_name, dry_run=False):
         response = requests.delete(url, headers=headers)
         if response.status_code == 204:
             logger.info(f"- Varset {varset_id} deleted for org {org_name}")
-            log_report(org_name, "delete_varset", varset_id, status="success")
+            log_report(org_name, "delete_varset", varset_id, status="success", message=f"Varset {varset_id} deleted for org {org_name}")
         elif response.status_code == 404:
             logger.error(f"! Varset {varset_id} not found for org {org_name}: {response.status_code} - {response.text}")
             log_report(org_name, "delete_variable", varset_id, status="error", message=response.text)
