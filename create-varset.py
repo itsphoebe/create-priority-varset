@@ -14,7 +14,7 @@ Features:
 - Uses multithreading to process multiple organizations concurrently for improved performance.
 - Logs detailed output to both the console and a log file.
 - Reports total script runtime at completion.
-- Generates a CSV report (`varset_report.csv`) summarizing all actions, changes, and errors for each organization and variable.
+- Generates a CSV report (`varset_report_%Y%m%d_%H%M%S.csv`) summarizing all actions, changes, and errors for each organization and variable.
 
 Usage Flow:
 1. Create:  
@@ -46,7 +46,7 @@ Notes:
     - Sensitive variable values cannot be read back from the API; updates may overwrite them.
     - Designed for administrative use; use with caution in production environments.
     - Everything will be logged to both the console and 'execution.log'.
-    - A CSV report of all actions and errors will be written to 'varset_report.csv'.
+    - A CSV report of all actions and errors will be written to 'varset_report_%Y%m%d_%H%M%S.csv'.
     - Organization selection precedence:
         1. If the optional --orgs flag is provided:
             - If the value is a path to a file, each line in the file is treated as an organization name.
@@ -66,6 +66,9 @@ import concurrent.futures
 import csv
 import threading
 import sys
+import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 tfe_url = None 
 varset_name = None
@@ -87,6 +90,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ])
 logger = logging.getLogger(__name__)
+logging.getLogger("urllib3").setLevel(logging.INFO)
 
 # Read in config file
 def load_config(config_path="config.yaml"):
@@ -123,7 +127,7 @@ def list_orgs():
     while True:
         try:
             url = f"{tfe_url}{api_prefix}organizations?page[number]={page_number}&page[size]={page_size}"
-            response = requests.get(url, headers=headers)
+            response = session.get(url, headers=headers)
             response.raise_for_status()
             data = response.json()
 
@@ -175,7 +179,7 @@ def create_global_priority_varset(org_name, dry_run=False):
         return
 
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        response = session.post(url, headers=headers, json=payload)
         if response.status_code == 201:
             varset_id = response.json()["data"]["id"]
             logger.info(f"Varset created for org {org_name} with ID {varset_id}")
@@ -221,7 +225,7 @@ def add_variable(org_name, varset_id, var, dry_run=False):
         return
 
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        response = session.post(url, headers=headers, json=payload)
         if response.status_code == 201:
             logger.info(f"+ Variable {var['key']} added to varset {varset_id}")
             log_report(org_name, "add_variable", varset_id, variable=var["key"], status="success", message=f"Variable {var['key']} added to varset {varset_id}")
@@ -249,7 +253,7 @@ def delete_global_priority_varset(org_name, dry_run=False):
         return
 
     try: 
-        response = requests.delete(url, headers=headers)
+        response = session.delete(url, headers=headers)
         if response.status_code == 204:
             logger.info(f"- Varset {varset_id} deleted for org {org_name}")
             log_report(org_name, "delete_varset", varset_id, status="success", message=f"Varset {varset_id} deleted for org {org_name}")
@@ -270,7 +274,7 @@ def delete_variable(org_name, varset_id, var_id, var_name, dry_run=False):
         return
 
     try:
-        response = requests.delete(url, headers=headers)
+        response = session.delete(url, headers=headers)
         response.raise_for_status()
 
         if response.status_code == 204:
@@ -305,7 +309,7 @@ def update_variable(org_name, varset_id, var_id, desired, dry_run=False):
         return
 
     try:
-        response = requests.patch(url, headers=headers, json=payload)
+        response = session.patch(url, headers=headers, json=payload)
         response.raise_for_status()
 
         if response.status_code == 200:
@@ -371,7 +375,7 @@ def get_global_priority_varset_id(org_name):
     while True:
         url = f"{tfe_url}{api_prefix}organizations/{org_name}/varsets?page[number]={page_number}&page[size]={page_size}"
         try:
-            response = requests.get(url, headers=headers)
+            response = session.get(url, headers=headers)
             response.raise_for_status()
             data = response.json()
             varsets = response.json().get("data", [])
@@ -397,7 +401,7 @@ def get_global_priority_varset_id(org_name):
 def get_variables_in_varset(varset_id):
     url = f"{tfe_url}{api_prefix}varsets/{varset_id}/relationships/vars"
     try:
-        response = requests.get(url, headers=headers)
+        response = session.get(url, headers=headers)
         response.raise_for_status()
         return response.json().get("data", [])
     except requests.exceptions.RequestException as e:
@@ -416,6 +420,26 @@ def process_org(org, mode, dry_run):
         logger.info(f"Updating varset for org {org}...")
         update_global_priority_varset(org, dry_run=dry_run)
     time.sleep(0.5)  # To avoid API rate limits
+
+# Create a requests session with retries (max 6 retries, exponential backoff)
+# Covers 429 for rate limits
+def get_requests_session_with_retries(retries=6, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504)):
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+# Create a global session object
+session = get_requests_session_with_retries()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Create global priority varset for each org in TFE")
@@ -487,19 +511,20 @@ if __name__ == "__main__":
 
     # Write CSV report
     if report_rows:
-        with open("varset_report.csv", "w", newline="") as csvfile:
+        report_filename = f"varset_report_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv"
+        with open(report_filename, "w", newline="") as csvfile:
             fieldnames = ["org", "action", "variable set ID", "variable", "status", "message"]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             for row in report_rows:
                 writer.writerow(row)
-        logger.info("CSV report written to varset_report.csv")
+        logger.info(f"CSV report written to {report_filename}")
 
     errors = [row for row in report_rows if row["status"] != "success"]
     if errors:
-        logger.warning(f"{len(errors)} actions failed or were skipped. See varset_report.csv for details.")
+        logger.warning(f"{len(errors)} actions failed or were skipped. See {report_filename} for details.")
     else:
         logger.info("All actions completed successfully.")
 
     end_time = time.time()
-    logger.info(f"Total script runtime: {end_time - start_time:.2f} seconds")
+    logger.info(f"Total script runtime: {end_time - start_time:.2f} seconds ({(end_time - start_time) / 60:.2f} minutes)")
